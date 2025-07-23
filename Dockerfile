@@ -1,7 +1,7 @@
 # Start FROM Nvidia PyTorch image https://ngc.nvidia.com/catalog/containers/nvidia:pytorch
 FROM nvcr.io/nvidia/pytorch:21.03-py3
 
-# Install linux packages
+# Install linux packages (libgl1-mesa-glx is required for OpenCV)
 RUN apt update && apt install -y zip htop screen libgl1-mesa-glx
 
 # Install python dependencies
