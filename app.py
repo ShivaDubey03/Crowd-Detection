@@ -1,83 +1,60 @@
 import streamlit as st
-import torch
-import cv2
 import numpy as np
-from pathlib import Path
-from models.experimental import attempt_load
-from utils.general import non_max_suppression, scale_coords
-from utils.torch_utils import select_device
-from utils.datasets import letterbox
+import cv2
 from PIL import Image
+from ultralytics import YOLO
 
-# Load model once
-@st.cache_resource
-def load_model():
-    model_path = 'weights/yolo-crowd.pt'
-    if not Path(model_path).exists():
-        st.error(f"Model file not found: {model_path}")
-        return None, None
-    
-    try:
-        device = select_device('cpu')
-        model = attempt_load(model_path, map_location=device)
-        model.eval()
-        return model, device
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None
+# Load YOLOv8 model
+model = YOLO("yolov8n.pt")
 
-def run_detection(image, model, device, img_size=416, conf_thres=0.25, iou_thres=0.45):
-    try:
-        # Ensure image is in RGB
-        img0 = np.array(image.convert('RGB'))
-        
-        # Preprocess
-        img = letterbox(img0, new_shape=img_size)[0]
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
-        img = torch.from_numpy(img).to(device)
-        img = img.float() / 255.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
+def compute_density_map(img, results, num_rows=3, num_cols=3):
+    h, w = img.shape[:2]
+    cell_h, cell_w = h // num_rows, w // num_cols
 
-        # Inference
-        with torch.no_grad():
-            pred = model(img)[0]
-            pred = non_max_suppression(pred, conf_thres, iou_thres)[0]
+    density_map = np.zeros((num_rows, num_cols), dtype=int)
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    classes = results[0].boxes.cls.cpu().numpy()
 
-        # Draw boxes
-        if pred is not None and len(pred):
-            pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], img0.shape).round()
-            for *xyxy, conf, cls in pred:
-                label = f'person {conf:.2f}'
-                xyxy = [int(x.item()) for x in xyxy]
-                cv2.rectangle(img0, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0,255,0), 2)
-                cv2.putText(img0, label, (xyxy[0], xyxy[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-        return img0, len(pred) if pred is not None else 0
-    except Exception as e:
-        st.error(f"Error during detection: {str(e)}")
-        return None, 0
+    for box, cls in zip(boxes, classes):
+        if int(cls) == 0:
+            xc = (box[0] + box[2]) / 2
+            yc = (box[1] + box[3]) / 2
+            row = min(int(yc // cell_h), num_rows - 1)
+            col = min(int(xc // cell_w), num_cols - 1)
+            density_map[row, col] += 1
 
-st.title('YOLO-CROWD DETECTION')
-st.write('Upload an image to detect number of people.')
+    return density_map
 
-uploaded_file = st.file_uploader('Choose an image...', type=['jpg', 'jpeg', 'png'])
+def draw_density_overlay(img, density_map):
+    num_rows, num_cols = density_map.shape
+    cell_h, cell_w = img.shape[0] // num_rows, img.shape[1] // num_cols
 
-if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file)
-        st.image(image, caption='Uploaded Image', use_container_width=True)
-        st.write('Running detection...')
-        
-        model, device = load_model()
-        if model is not None and device is not None:
-            result_img, count = run_detection(image, model, device)
-            if result_img is not None:
-                st.image(result_img, caption=f'Detected {count} people', use_container_width=True)
-                st.success(f'Detection complete: {count} people found.')
-            else:
-                st.error("Detection failed. Please try again with a different image.")
-        else:
-            st.error("Failed to load the model. Please check if the model file exists and is accessible.")
-    except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+    for r in range(num_rows):
+        for c in range(num_cols):
+            x0, y0 = c * cell_w, r * cell_h
+            x1, y1 = x0 + cell_w, y0 + cell_h
+            cv2.rectangle(img, (x0, y0), (x1, y1), (255, 0, 0), 1)
+            cv2.putText(img, str(density_map[r, c]), (x0 + 10, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    return img
+
+def app():
+    st.title("YOLO Crowd Detection + Density Map")
+
+    img_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+    if img_file:
+        img = np.array(Image.open(img_file).convert("RGB"))
+        results = model(img)
+
+        annotated_img = np.array(results[0].plot())
+        density_map = compute_density_map(annotated_img, results)
+        output_img = draw_density_overlay(annotated_img.copy(), density_map)
+
+        st.image(output_img, caption="Detected persons + density overlay", use_column_width=True)
+        total = int((results[0].boxes.cls.cpu().numpy() == 0).sum())
+        st.write(f"🧑 Total Persons Detected: **{total}**")
+        st.write("📊 Density per region (rows × cols):")
+        st.table(density_map)
+
+if __name__ == "__main__":
+    app()
