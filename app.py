@@ -1,29 +1,12 @@
 import streamlit as st
 import numpy as np
 import cv2
-from PIL import Image, ExifTags
+import time
+from PIL import Image
 from ultralytics import YOLO
 
-# Load YOLOv8 model
+# Load the YOLOv8 model
 model = YOLO("yolov8n.pt")
-
-def load_image_with_correct_orientation(file):
-    image = Image.open(file)
-    try:
-        for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation] == "Orientation":
-                break
-        exif = dict(image._getexif().items())
-        orientation_value = exif.get(orientation)
-        if orientation_value == 3:
-            image = image.rotate(180, expand=True)
-        elif orientation_value == 6:
-            image = image.rotate(270, expand=True)
-        elif orientation_value == 8:
-            image = image.rotate(90, expand=True)
-    except Exception:
-        pass
-    return np.array(image.convert("RGB"))
 
 def compute_density_map(img, results, num_rows=3, num_cols=3):
     h, w = img.shape[:2]
@@ -31,8 +14,9 @@ def compute_density_map(img, results, num_rows=3, num_cols=3):
     density_map = np.zeros((num_rows, num_cols), dtype=int)
     boxes = results[0].boxes.xyxy.cpu().numpy()
     classes = results[0].boxes.cls.cpu().numpy()
+
     for box, cls in zip(boxes, classes):
-        if int(cls) == 0:
+        if int(cls) == 0:  # class 0 = person
             xc = (box[0] + box[2]) / 2
             yc = (box[1] + box[3]) / 2
             row = min(int(yc // cell_h), num_rows - 1)
@@ -43,6 +27,7 @@ def compute_density_map(img, results, num_rows=3, num_cols=3):
 def draw_density_overlay(img, density_map):
     num_rows, num_cols = density_map.shape
     cell_h, cell_w = img.shape[0] // num_rows, img.shape[1] // num_cols
+
     for r in range(num_rows):
         for c in range(num_cols):
             x0, y0 = c * cell_w, r * cell_h
@@ -52,36 +37,76 @@ def draw_density_overlay(img, density_map):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     return img
 
-def app():
-    st.title("Crowd Detection & Density Map")
+def run_webcam_detection():
+    st.subheader("📷 Live Camera Stream")
+    cam_placeholder = st.empty()
+    counter_placeholder = st.empty()
+    stop_btn = st.button("⏹ Stop Camera")
+    cap = cv2.VideoCapture(0)
 
-    img_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-    if img_file:
-        img = load_image_with_correct_orientation(img_file)
-        results = model(img)
+    if not cap.isOpened():
+        st.error("❌ Could not access webcam.")
+        return
 
-        # Get annotated YOLO image
-        annotated_img = np.array(results[0].plot())
+    while not stop_btn:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # Count people
-        total = int((results[0].boxes.cls.cpu().numpy() == 0).sum())
+        # Resize to reduce height
+        scale = 1
+        h, w = frame.shape[:2]
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
 
-        # Compute density grid
-        density_map = compute_density_map(img, results)
-        final_img = draw_density_overlay(annotated_img.copy(), density_map)
+        results = model(frame)
+        boxes = results[0].boxes
+        people_indices = (boxes.cls == 0)  # Only keep class 0 = person
+        boxes.data = boxes.data[people_indices]
 
-        # Draw total people green box on image
-        cv2.rectangle(final_img, (10, 10), (270, 60), (0, 255, 0), -1)
-        cv2.putText(final_img, f'Total Persons: {total}', (20, 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+        annotated = results[0].plot()
+        count = int(len(boxes.data))
 
-        # Display image with overlays
-        st.image(final_img, caption="Detections + Region Density", use_container_width=True)
-        st.success(f"🧍 Total Persons Detected: {total}")
-        st.write("📊 Region-wise person count:")
-        st.table(density_map)
+        # Draw count in top-left corner
+        cv2.putText(annotated, f"People: {count}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+            0.8, (0, 0, 255), 1, cv2.LINE_AA)
 
-# ...existing code...
+
+        annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        cam_placeholder.image(annotated, channels="RGB", use_container_width=True)
+        counter_placeholder.markdown(f"🧍 Persons Detected: **{count}**")
+        time.sleep(0.1)
+
+    cap.release()
+
+def main():
+    st.title("SmartCrowd")
+    st.caption("Real-Time Person Detection and Density Mapping")
+
+    option = st.radio("Select Mode", ["Upload Image", "Live Webcam"], horizontal=True)
+
+    if option == "Upload Image":
+        st.subheader("📸 Upload Image")
+        img_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
+        if img_file:
+            img = np.array(Image.open(img_file).convert("RGB"))
+            results = model(img)
+
+            boxes = results[0].boxes
+            person_indices = (boxes.cls == 0)
+            boxes.data = boxes.data[person_indices]
+
+            annotated_img = np.array(results[0].plot())
+            density_map = compute_density_map(annotated_img, results)
+            output_img = draw_density_overlay(annotated_img.copy(), density_map)
+
+            st.image(output_img, caption="Detected Persons + Density Overlay", use_container_width=True)
+            total = int(len(boxes.data))
+            st.success(f"🧑 Total Persons Detected: {total}")
+            st.write("📊 Density (Rows × Columns):")
+            st.table(density_map)
+
+    elif option == "Live Webcam":
+        run_webcam_detection()
 
 if __name__ == "__main__":
-    app()
+    main()
